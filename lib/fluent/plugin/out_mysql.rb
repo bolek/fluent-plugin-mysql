@@ -1,83 +1,34 @@
 class Fluent::MysqlOutput < Fluent::BufferedOutput
-  Fluent::Plugin.register_output('mysql', self)
+  Fluent::Plugin.register_output("mysql", self)
 
   include Fluent::SetTimeKeyMixin
   include Fluent::SetTagKeyMixin
 
   config_param :host, :string
-  config_param :port, :integer, :default => nil
+  config_param :port, :integer, default: nil
   config_param :database, :string
   config_param :username, :string
-  config_param :password, :string, :default => ''
+  config_param :password, :string, default: ""
 
-  config_param :key_names, :string, :default => nil # nil allowed for json format
-  config_param :sql, :string, :default => nil
-  config_param :table, :string, :default => nil
-  config_param :columns, :string, :default => nil
+  config_param :table, :string, default: nil
 
-  config_param :format, :string, :default => "raw" # or json
-
-  attr_accessor :handler
+  attr_accessor :handler, :sql
 
   def initialize
     super
-    require 'mysql2-cs-bind'
-    require 'jsonpath'
+    require "mysql2-cs-bind"
   end
 
   # Define `log` method for v0.10.42 or earlier
-  unless method_defined?(:log)
-    define_method("log") { $log }
-  end
+  define_method("log") { $log } unless method_defined?(:log)
 
   def configure(conf)
     super
 
-    # TODO tag_mapped
-
-    case @format
-    when 'json'
-      @format_proc = Proc.new{|tag, time, record| record.to_json}
-    when 'jsonpath'
-      @key_names = @key_names.split(/\s*,\s*/)
-      @format_proc = Proc.new do |tag, time, record|
-        json = record.to_json
-        @key_names.map do |k|
-          JsonPath.new(k.strip).on(json).first
-        end
-      end
-    else
-      @key_names = @key_names.split(/\s*,\s*/)
-      @format_proc = Proc.new{|tag, time, record| @key_names.map{|k| record[k]}}
-    end
-
-    if @columns.nil? and @sql.nil?
-      raise Fluent::ConfigError, "columns or sql MUST be specified, but missing"
-    end
-    if @columns and @sql
-      raise Fluent::ConfigError, "both of columns and sql are specified, but specify one of them"
-    end
-
-    if @sql
-      begin
-        if @format == 'json'
-          Mysql2::Client.pseudo_bind(@sql, [nil])
-        else
-          Mysql2::Client.pseudo_bind(@sql, @key_names.map{|n| nil})
-        end
-      rescue ArgumentError => e
-        raise Fluent::ConfigError, "mismatch between sql placeholders and key_names"
-      end
-    else # columns
-      raise Fluent::ConfigError, "table missing" unless @table
-      @columns = @columns.split(/\s*,\s*/)
-      cols = @columns.join(',')
-      placeholders = if @format == 'json'
-                       '?'
-                     else
-                       @key_names.map{|k| '?'}.join(',')
-                     end
-      @sql = "INSERT INTO #{@table} (#{cols}) VALUES (#{placeholders})"
+    @sql = "INSERT INTO #{@table} (tag,logged_at,occured_at,payload) VALUES (?,?,?,?)"
+    @format_proc = proc do |tag, time, record|
+      at = record["occured_at"] ? record["occured_at"] : Time.at(time).utc.strftime("%Y-%m-%d %H:%M:%S")
+      [tag, Time.at(time).utc.strftime("%Y-%m-%d %H:%M:%S"), at, record.to_json]
     end
   end
 
@@ -94,18 +45,16 @@ class Fluent::MysqlOutput < Fluent::BufferedOutput
   end
 
   def client
-    Mysql2::Client.new({
-        :host => @host, :port => @port,
-        :username => @username, :password => @password,
-        :database => @database, :flags => Mysql2::Client::MULTI_STATEMENTS,
-      })
+    Mysql2::Client.new(
+      host: @host, port: @port,
+      username: @username, password: @password,
+      database: @database, flags: Mysql2::Client::MULTI_STATEMENTS
+    )
   end
 
   def write(chunk)
-    handler = self.client
-    chunk.msgpack_each { |tag, time, data|
-      handler.xquery(@sql, data)
-    }
+    handler = client
+    chunk.msgpack_each { |tag, time, data| handler.xquery(@sql, data) }
     handler.close
   end
 end
